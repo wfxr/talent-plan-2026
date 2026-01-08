@@ -1,20 +1,24 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
-use std::thread;
-use std::time::Duration;
 
 use labrpc::*;
 use prost::Message;
 
-use crate::client::Client;
-use crate::server::{MemoryStorage, TimestampOracle};
-use crate::service::{add_transaction_service, add_tso_service, TSOClient, TransactionClient};
+use crate::{
+    client::Client,
+    server::{MemoryStorage, TimestampOracle},
+    service::{add_transaction_service, add_tso_service, TSOClient, TransactionClient},
+};
 
 struct CommitHooks {
-    drop_req: AtomicBool,
-    drop_resp: AtomicBool,
+    drop_req:     AtomicBool,
+    drop_resp:    AtomicBool,
     fail_primary: AtomicBool,
 }
 
@@ -61,8 +65,8 @@ fn init(num_clinet: usize) -> (Network, Vec<Client>, Arc<CommitHooks>) {
     rn.add_server(tso_server);
     rn.add_server(server);
     let hook = Arc::new(CommitHooks {
-        drop_req: AtomicBool::new(false),
-        drop_resp: AtomicBool::new(false),
+        drop_req:     AtomicBool::new(false),
+        drop_resp:    AtomicBool::new(false),
         fail_primary: AtomicBool::new(false),
     });
     for i in 0..num_clinet {
