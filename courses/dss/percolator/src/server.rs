@@ -210,7 +210,7 @@ impl MemoryStorage {
         key: Vec<u8>,
         max_start_ts: u64,
     ) -> Option<(Vec<u8>, u64, bool)> {
-        let mut store = self.data.lock().unwrap();
+        let store = self.data.lock().unwrap();
 
         let (pkey, start_ts) =
             match store.read(key.clone(), Column::Lock, None, Some(max_start_ts))? {
