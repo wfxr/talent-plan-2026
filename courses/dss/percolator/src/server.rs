@@ -114,6 +114,8 @@ impl KvTable {
         }
     }
 
+    #[inline]
+    // Find the commit timestamp for a given key and start timestamp.
     fn find_commit_ts(&self, key: Vec<u8>, start_ts: u64) -> Option<u64> {
         self.cf(Column::Write)
             .range((key.clone(), start_ts)..=(key, u64::MAX))
@@ -138,7 +140,7 @@ impl transaction::Service for MemoryStorage {
         // Your code here.
         let GetRequest { start_ts, key } = req;
 
-        // try to clean up pending locks
+        // try to clean up pending locks, if any
         self.back_off_maybe_clean_up_lock(start_ts, key.clone());
 
         let store = self.data.lock().unwrap();
@@ -147,7 +149,7 @@ impl transaction::Service for MemoryStorage {
                 Timestamp(start_ts) =>
                     match store.read(key, Column::Data, Some(*start_ts), Some(*start_ts)) {
                         Some((_, Vector(body))) => Ok(GetResponse { value: body.clone() }),
-                        Some(_) => unreachable!("data cf should only have Vector values"),
+                        Some((_, _)) => unreachable!("data cf should only have Vector values"),
                         None => Ok(GetResponse { value: vec![] }),
                     },
                 _ => unreachable!("write cf should only have Timestamp values"),
@@ -203,13 +205,9 @@ impl transaction::Service for MemoryStorage {
 }
 
 impl MemoryStorage {
-    // Inspect the primary lock for a given key and max_start_ts.
-    // Return (primary_key, pkey_start_ts, pkey_lock_exists).
-    fn inspect_primary_lock(
-        &self,
-        key: Vec<u8>,
-        max_start_ts: u64,
-    ) -> Option<(Vec<u8>, u64, bool)> {
+    // Inspect the lock for a given key and max_start_ts. Return (pkey, pkey_start_ts,
+    // pkey_lock_exists).
+    fn inspect_lock(&self, key: Vec<u8>, max_start_ts: u64) -> Option<(Vec<u8>, u64, bool)> {
         let store = self.data.lock().unwrap();
 
         let (pkey, start_ts) =
@@ -223,6 +221,7 @@ impl MemoryStorage {
             return Some((pkey, start_ts, true));
         }
 
+        // check if the primary lock still exists
         let plock = store.read(pkey.clone(), Column::Lock, Some(start_ts), Some(start_ts));
         Some((pkey, start_ts, plock.is_some()))
     }
@@ -230,17 +229,17 @@ impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, max_start_ts: u64, key: Vec<u8>) {
         // Your code here.
         loop {
-            match self.inspect_primary_lock(key.clone(), max_start_ts) {
+            match self.inspect_lock(key.clone(), max_start_ts) {
                 Some((pkey, start_ts, true)) => {
                     // primary lock exists, wait for it to be committed or expired
                     thread::sleep(Duration::from_nanos(TTL));
 
-                    // now the lock must committed or expired, so just clean it up
+                    // now the lock must committed or expired, just clean it up
                     let mut store = self.data.lock().unwrap();
                     store.erase(key.clone(), Column::Lock, start_ts);
                 }
                 Some((pkey, start_ts, false)) => {
-                    // primary lock does not exist, try to find the commit ts of the primary key
+                    // primary lock does not exist, try to find the commit ts from write cf
                     let mut store = self.data.lock().unwrap();
                     if let Some(commit_ts) = store.find_commit_ts(pkey.clone(), start_ts) {
                         store.write(key.clone(), Column::Write, commit_ts, Timestamp(start_ts));

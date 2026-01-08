@@ -51,8 +51,8 @@ impl Client {
     /// Begins a new transaction.
     pub fn begin(&mut self) {
         // Your code here.
-        // TODO: Should this method return a Result?
         self.buffer.clear();
+        // TODO: this method should return a Result?
         self.start_ts = self.get_timestamp().expect("Failed to get timestamp");
     }
 
@@ -71,9 +71,9 @@ impl Client {
         self.buffer.insert(key, value);
     }
 
-    fn request_precommit(&self, key: Vec<u8>, value: Vec<u8>, pkey: Vec<u8>) -> Result<bool> {
+    fn request_prewrite(&self, key: Vec<u8>, value: Vec<u8>, pkey: Vec<u8>) -> Result<bool> {
         let req = PrewriteRequest { start_ts: self.start_ts, pkey, key, value };
-        with_retry("precommit request", || {
+        with_retry("prewrite request", || {
             block_on(async { self.txn_client.prewrite(&req).await })
         })
         .map(|resp| resp.success)
@@ -101,9 +101,9 @@ impl Client {
             Some(key) => (key, keys),
         };
 
-        // 1. do prewrite for each entry
+        // 1. request prewrite for each entry
         for (key, value) in &self.buffer {
-            match self.request_precommit(key.clone(), value.clone(), primary.clone()) {
+            match self.request_prewrite(key.clone(), value.clone(), primary.clone()) {
                 Ok(true) => continue,
                 failed => return failed,
             }
@@ -117,8 +117,7 @@ impl Client {
             return Ok(false);
         }
 
-        // 4. commit secondaries
-        // PERF: do this asynchronously for better latency
+        // 4. commit secondaries (can be done asynchronously)
         for key in secondaries {
             let resp = self.request_commit(commit_ts, key.clone(), false);
 
