@@ -103,9 +103,8 @@ impl Client {
 
         // 1. request prewrite for each entry
         for (key, value) in &self.buffer {
-            match self.request_prewrite(key.clone(), value.clone(), primary.clone()) {
-                Ok(true) => continue,
-                failed => return failed,
+            if !self.request_prewrite(key.clone(), value.clone(), primary.clone())? {
+                return Ok(false);
             }
         }
 
