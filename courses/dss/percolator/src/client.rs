@@ -102,7 +102,7 @@ impl Client {
             return Ok(true);
         }
 
-        // Do prewrite for each entry
+        // 1. do prewrite for each entry
         let pkey = &self.entries[0].0;
         for (key, value) in &self.entries {
             let req = PrewriteRequest {
@@ -118,10 +118,10 @@ impl Client {
             }
         }
 
-        // Get commit timestamp
+        // 2. get commit timestamp
         let commit_ts = self.get_timestamp()?;
 
-        // Commit primary first
+        // 3. commit primary first
         let req = CommitRequest {
             is_primary: true,
             key: pkey.clone(),
@@ -135,7 +135,7 @@ impl Client {
             Ok(_) => {}
         }
 
-        // Commit secondaries
+        // 4. commit secondaries
         // PERF: We can do this asynchronously for better latency
         let secondaries = &self.entries[1..];
         for (key, _) in secondaries {
