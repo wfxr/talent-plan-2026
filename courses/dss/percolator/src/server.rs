@@ -143,7 +143,7 @@ impl transaction::Service for MemoryStorage {
 
         let store = self.data.lock().unwrap();
         match store.read(key.clone(), Column::Write, None, Some(start_ts)) {
-            Some(((k, commit_ts), v)) => match v {
+            Some(((_, commit_ts), v)) => match v {
                 Timestamp(start_ts) =>
                     match store.read(key, Column::Data, Some(*start_ts), Some(*start_ts)) {
                         Some((_, Vector(body))) => Ok(GetResponse { value: body.clone() }),
