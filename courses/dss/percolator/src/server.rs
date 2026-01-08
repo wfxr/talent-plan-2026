@@ -5,10 +5,12 @@ use std::{
         Arc,
         Mutex,
     },
+    thread,
     time::Duration,
 };
 
 use crate::{msg::*, service::*, *};
+use Value::*;
 
 // TTL is used for a lock key.
 // If the key's lifetime exceeds this value, it should be cleaned up.
@@ -26,7 +28,7 @@ impl timestamp::Service for TimestampOracle {
     // example get_timestamp RPC handler.
     async fn get_timestamp(&self, _: TimestampRequest) -> labrpc::Result<TimestampResponse> {
         // Your code here.
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         // +1 to make tso start from 1
         Ok(TimestampResponse { tso: seq + 1 })
     }
@@ -75,7 +77,7 @@ impl KvTable {
         let ts_end = ts_end_inclusive.unwrap_or(u64::MAX);
         self.cf(column)
             .range((key.clone(), ts_start)..=(key, ts_end))
-            .next_back()
+            .last()
     }
 
     // Writes a record to a specified column in MemoryStorage.
@@ -111,6 +113,15 @@ impl KvTable {
             Column::Lock => &self.lock,
         }
     }
+
+    fn find_commit_ts(&self, key: Vec<u8>, start_ts: u64) -> Option<u64> {
+        self.cf(Column::Write)
+            .range((key.clone(), start_ts)..=(key, u64::MAX))
+            .find_map(|((_, commit_ts), value)| match value {
+                Timestamp(ts) if *ts == start_ts => Some(*commit_ts),
+                _ => None,
+            })
+    }
 }
 
 // MemoryStorage is used to wrap a KvTable.
@@ -125,7 +136,7 @@ impl transaction::Service for MemoryStorage {
     // example get RPC handler.
     async fn get(&self, req: GetRequest) -> labrpc::Result<GetResponse> {
         // Your code here.
-        let GetRequest { key, start_ts } = req;
+        let GetRequest { start_ts, key } = req;
 
         // try to clean up pending locks
         self.back_off_maybe_clean_up_lock(start_ts, key.clone());
@@ -133,13 +144,13 @@ impl transaction::Service for MemoryStorage {
         let store = self.data.lock().unwrap();
         match store.read(key.clone(), Column::Write, None, Some(start_ts)) {
             Some(((k, commit_ts), v)) => match v {
-                Value::Timestamp(start_ts) =>
+                Timestamp(start_ts) =>
                     match store.read(key, Column::Data, Some(*start_ts), Some(*start_ts)) {
-                        Some((_, Value::Vector(body))) => Ok(GetResponse { value: body.clone() }),
-                        Some(_) => unreachable!("data column should only have Vector values"),
+                        Some((_, Vector(body))) => Ok(GetResponse { value: body.clone() }),
+                        Some(_) => unreachable!("data cf should only have Vector values"),
                         None => Ok(GetResponse { value: vec![] }),
                     },
-                _ => unreachable!("write column should only have Timestamp values"),
+                _ => unreachable!("write cf should only have Timestamp values"),
             },
             None => Ok(GetResponse { value: vec![] }),
         }
@@ -148,125 +159,97 @@ impl transaction::Service for MemoryStorage {
     // example prewrite RPC handler.
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
         // Your code here.
-        let PrewriteRequest { pkey, key, value, start_ts } = req;
+        let PrewriteRequest { start_ts, pkey, key, value } = req;
         let mut store = self.data.lock().unwrap();
 
-        // fail if there is already a lock
-        if store.read(key.clone(), Column::Lock, None, None).is_some() {
-            return Ok(PrewriteResponse { ok: false });
-        }
-
-        // fail if there is a committed write with commit_ts > start_ts
+        // abort if there is a committed write with commit_ts >= start_ts
         if store
-            .read(key.clone(), Column::Write, Some(start_ts + 1), None)
+            .read(key.clone(), Column::Write, Some(start_ts), None)
             .is_some()
         {
-            return Ok(PrewriteResponse { ok: false });
+            return Ok(PrewriteResponse { success: false });
         }
 
-        store.write(key.clone(), Column::Lock, start_ts, Value::Vector(pkey));
-        store.write(key.clone(), Column::Data, start_ts, Value::Vector(value));
+        // abort if there is already a lock
+        if store.read(key.clone(), Column::Lock, None, None).is_some() {
+            return Ok(PrewriteResponse { success: false });
+        }
 
-        Ok(PrewriteResponse { ok: true })
+        store.write(key.clone(), Column::Data, start_ts, Vector(value));
+        store.write(key.clone(), Column::Lock, start_ts, Vector(pkey));
+
+        Ok(PrewriteResponse { success: true })
     }
 
     // example commit RPC handler.
     async fn commit(&self, req: CommitRequest) -> labrpc::Result<CommitResponse> {
         // Your code here.
-        let CommitRequest { is_primary, key, start_ts, commit_ts } = req;
+        let CommitRequest { start_ts, commit_ts, key, .. } = req;
         let mut store = self.data.lock().unwrap();
 
-        store.write(
-            key.clone(),
-            Column::Write,
-            commit_ts,
-            Value::Timestamp(start_ts),
-        );
-        store.erase(key.clone(), Column::Lock, start_ts);
+        // abort if there is no lock
+        if store
+            .read(key.clone(), Column::Lock, Some(start_ts), Some(start_ts))
+            .is_none()
+        {
+            return Ok(CommitResponse { success: false });
+        }
 
-        Ok(CommitResponse { ok: true })
+        store.write(key.clone(), Column::Write, commit_ts, Timestamp(start_ts));
+        store.erase(key, Column::Lock, start_ts);
+
+        Ok(CommitResponse { success: true })
     }
 }
 
 impl MemoryStorage {
-    fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
+    // Inspect the primary lock for a given key and max_start_ts.
+    // Return (primary_key, pkey_start_ts, pkey_lock_exists).
+    fn inspect_primary_lock(
+        &self,
+        key: Vec<u8>,
+        max_start_ts: u64,
+    ) -> Option<(Vec<u8>, u64, bool)> {
+        let mut store = self.data.lock().unwrap();
+
+        let (pkey, start_ts) =
+            match store.read(key.clone(), Column::Lock, None, Some(max_start_ts))? {
+                ((_, start_ts), Vector(pkey)) => (pkey.clone(), *start_ts),
+                _ => unreachable!("lock cf should only have Vector values"),
+            };
+
+        if pkey == key {
+            // fastpath: this is the primary lock, no need to read again
+            return Some((pkey, start_ts, true));
+        }
+
+        let plock = store.read(pkey.clone(), Column::Lock, Some(start_ts), Some(start_ts));
+        Some((pkey, start_ts, plock.is_some()))
+    }
+
+    fn back_off_maybe_clean_up_lock(&self, max_start_ts: u64, key: Vec<u8>) {
         // Your code here.
         loop {
-            let mut store = self.data.lock().unwrap();
+            match self.inspect_primary_lock(key.clone(), max_start_ts) {
+                Some((pkey, start_ts, true)) => {
+                    // primary lock exists, wait for it to be committed or expired
+                    thread::sleep(Duration::from_nanos(TTL));
 
-            // inspect if there is a lock on this key
-            let (pkey_start_ts, pkey) =
-                match store.read(key.clone(), Column::Lock, None, Some(start_ts)) {
-                    Some(((_, pkey_start_ts), Value::Vector(pkey))) =>
-                        (*pkey_start_ts, pkey.clone()),
-                    Some((_, Value::Timestamp(_))) =>
-                        unreachable!("lock column should only have Vector values"),
-                    // no lock found, just return
-                    None => return,
-                };
-
-            if pkey == key {
-                // it's a primary lock, wait for TTL
-                drop(store);
-                std::thread::sleep(Duration::from_nanos(TTL));
-
-                // the lock must committed or expired now, so just clean it up
-                let mut store = self.data.lock().unwrap();
-                store.erase(key.clone(), Column::Lock, pkey_start_ts);
-            } else {
-                // it's a secondary lock, check if the primary has been committed
-                let plock = store.read(
-                    pkey.clone(),
-                    Column::Lock,
-                    Some(pkey_start_ts),
-                    Some(pkey_start_ts),
-                );
-                if plock.is_some() {
-                    // primary lock still exists, back off
-                    drop(store);
-                    std::thread::sleep(Duration::from_millis(10));
-
-                    // The lock must committed or expired now, so just clean it up
+                    // now the lock must committed or expired, so just clean it up
                     let mut store = self.data.lock().unwrap();
-                    store.erase(key.clone(), Column::Lock, pkey_start_ts);
-                } else {
-                    // primary lock does not exist, try to find the commit ts of the primary key
-                    let mut rbound = None;
-                    let mut pkey_commit_ts;
-                    loop {
-                        match store.read(pkey.clone(), Column::Write, Some(pkey_start_ts), rbound) {
-                            None => {
-                                // no write record found, primary must have not been committed
-                                pkey_commit_ts = None;
-                                break;
-                            }
-                            Some(((pkey, commit_ts), Value::Timestamp(start_ts))) => {
-                                if *start_ts == pkey_start_ts {
-                                    // found the commit ts of the primary
-                                    pkey_commit_ts = Some(*commit_ts);
-                                    break;
-                                }
-                                // Shrink the right bound and continue searching
-                                rbound = Some(*commit_ts - 1);
-                            }
-                            Some(_) =>
-                                unreachable!("write column should only have Timestamp values"),
-                        }
-                    }
-
-                    // 2. amend the secondary's write record if the primary has been committed
-                    if let Some(prev_commit_ts) = pkey_commit_ts {
-                        store.write(
-                            key.clone(),
-                            Column::Write,
-                            prev_commit_ts,
-                            Value::Timestamp(pkey_start_ts),
-                        );
-                    }
-
-                    // 3. clean up the secondary lock
-                    store.erase(key.clone(), Column::Lock, pkey_start_ts);
+                    store.erase(key.clone(), Column::Lock, start_ts);
                 }
+                Some((pkey, start_ts, false)) => {
+                    // primary lock does not exist, try to find the commit ts of the primary key
+                    let mut store = self.data.lock().unwrap();
+                    if let Some(commit_ts) = store.find_commit_ts(pkey.clone(), start_ts) {
+                        store.write(key.clone(), Column::Write, commit_ts, Timestamp(start_ts));
+                    }
+
+                    // clean up the secondary lock
+                    store.erase(key.clone(), Column::Lock, start_ts);
+                }
+                None => return,
             }
         }
     }
