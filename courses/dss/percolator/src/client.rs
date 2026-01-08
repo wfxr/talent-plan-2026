@@ -50,8 +50,6 @@ impl Client {
     /// Gets a timestamp from a TSO.
     pub fn get_timestamp(&self) -> Result<u64> {
         // Your code here.
-        let mut backoff_ms = BACKOFF_TIME_MS;
-        let mut retries = RETRY_TIMES;
         with_retry("get_timestamp request", || {
             block_on(async { self.tso_client.get_timestamp(&TimestampRequest {}).await })
         })
